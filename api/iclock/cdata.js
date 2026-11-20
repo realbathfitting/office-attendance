@@ -1,16 +1,25 @@
 const admin = require('firebase-admin');
 
-// Initialize Firebase Admin once
-if (!admin.apps.length) {
-  const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-  admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount)
-  });
+function initFirebase() {
+  if (!admin.apps.length) {
+    if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
+      throw new Error('FIREBASE_SERVICE_ACCOUNT environment variable is missing on Vercel!');
+    }
+    const rawJson = process.env.FIREBASE_SERVICE_ACCOUNT.trim();
+    const serviceAccount = JSON.parse(rawJson);
+
+    // Fix escaped newlines in private_key if Vercel altered them
+    if (serviceAccount.private_key) {
+      serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
+    }
+
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount)
+    });
+  }
+  return admin.firestore();
 }
 
-const db = admin.firestore();
-
-// Read raw text body from biometric machine
 function getRawBody(req) {
   return new Promise((resolve, reject) => {
     let data = '';
@@ -23,29 +32,28 @@ function getRawBody(req) {
 module.exports = async (req, res) => {
   res.setHeader('Content-Type', 'text/plain');
 
-  const { SN, table } = req.query;
+  try {
+    const db = initFirebase();
+    const { SN, table } = req.query;
 
-  // 1. Machine Handshake / Heartbeat (GET Request)
-  if (req.method === 'GET') {
-    if (SN) {
-      await db.collection('devices').doc(SN).set({
-        serialNumber: SN,
-        lastPing: admin.firestore.FieldValue.serverTimestamp(),
-        status: 'Online'
-      }, { merge: true });
+    if (req.method === 'GET') {
+      if (SN) {
+        await db.collection('devices').doc(SN).set({
+          serialNumber: SN,
+          lastPing: admin.firestore.FieldValue.serverTimestamp(),
+          status: 'Online'
+        }, { merge: true });
+      }
+      return res.status(200).send(
+        'GET OPTION FROM: ' + (SN || 'DEVICE') +
+        '\nStamp=9999\nOpStamp=9999\nErrorDelay=30\nDelay=10\nTransTimes=00:00;14:05\nTransInterval=1\nTransFlag=1111000000\nRealtime=1\nEncrypt=0\n'
+      );
     }
-    // Standard ADMS handshake response
-    return res.status(200).send('GET OPTION FROM: ' + (SN || 'DEVICE') + '\nStamp=9999\nOpStamp=9999\nErrorDelay=30\nDelay=10\nTransTimes=00:00;14:05\nTransInterval=1\nTransFlag=1111000000\nRealtime=1\nEncrypt=0\n');
-  }
 
-  // 2. Receive Attendance Logs (POST Request)
-  if (req.method === 'POST') {
-    try {
+    if (req.method === 'POST') {
       const rawBody = await getRawBody(req);
 
       if (table === 'ATTLOG' && rawBody) {
-        // Biometric machine sends tab-separated lines:
-        // Example: 101	2026-11-20 09:32:10	0	1	0	0
         const lines = rawBody.trim().split('\n');
         const batch = db.batch();
 
@@ -53,11 +61,10 @@ module.exports = async (req, res) => {
           const parts = line.trim().split('\t');
           if (parts.length >= 2) {
             const biometricId = parts[0].trim();
-            const timestampStr = parts[1].trim(); // YYYY-MM-DD HH:mm:ss
-            const statusCode = parts[2] ? parts[2].trim() : '0'; // 0 = Check-In, 1 = Check-Out
+            const timestampStr = parts[1].trim();
+            const statusCode = parts[2] ? parts[2].trim() : '0';
             const [datePart, timePart] = timestampStr.split(' ');
 
-            // Unique doc ID prevents duplicate entries if machine retries
             const logId = `${biometricId}_${timestampStr.replace(/[:\s-]/g, '')}`;
             const logRef = db.collection('attendance_logs').doc(logId);
 
@@ -77,13 +84,12 @@ module.exports = async (req, res) => {
         return res.status(200).send(`OK: ${lines.length}`);
       }
 
-      // Acknowledge other tables (OPERLOG, USERINFO, etc.) so machine doesn't hang
       return res.status(200).send('OK');
-    } catch (error) {
-      console.error('ADMS Error:', error);
-      return res.status(500).send('ERROR');
     }
-  }
 
-  return res.status(200).send('OK');
+    return res.status(200).send('OK');
+  } catch (error) {
+    console.error('ADMS Function Error:', error);
+    return res.status(500).send('ERROR: ' + error.message);
+  }
 };
